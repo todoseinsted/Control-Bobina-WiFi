@@ -16,8 +16,8 @@ portMUX_TYPE controlMux = portMUX_INITIALIZER_UNLOCKED;
 ControlSettings settings = {10000, 3000, 0};
 bool running = false, timerReady = false;
 uint32_t generation = 0, bootId = 0, timerFaults = 0;
-uint32_t groupLow[2] = {}, groupHigh[2] = {}, allLowMask = 0, allHighMask = 0;
-uint32_t durations[4] = {};
+constexpr uint32_t allLowMask = (1UL << 22) | (1UL << 23);
+uint32_t durations[2] = {};
 uint64_t scheduledAt = 0;
 uint8_t phase = 0;
 enum Reason { BOOT, CONFIGURED, ACTIVE, STOPPED, WIFI_LOST, TIMER_FAULT };
@@ -26,7 +26,6 @@ Reason reason = BOOT;
 // One write per GPIO bank; no loops, allocation or waiting in the interrupt.
 void IRAM_ATTR allLow() {
   REG_WRITE(GPIO_OUT_W1TC_REG, allLowMask);
-  REG_WRITE(GPIO_OUT1_W1TC_REG, allHighMask);
 }
 
 bool IRAM_ATTR armAfter(uint32_t duration) {
@@ -50,14 +49,12 @@ bool IRAM_ATTR onPulse(gptimer_handle_t, const gptimer_alarm_event_data_t* event
     if (event->count_value > scheduledAt + 500) {
       timerFault();
     } else {
-      const unsigned group = phase / 2;
       if ((phase & 1) == 0) {
-        REG_WRITE(GPIO_OUT_W1TS_REG, groupLow[group]);
-        REG_WRITE(GPIO_OUT1_W1TS_REG, groupHigh[group]);
+        REG_WRITE(GPIO_OUT_W1TS_REG, allLowMask);
       } else allLow();
       // Schedule from now: never compress pulses to catch up after a delay.
       if (!armAfter(durations[phase])) timerFault();
-      phase = (phase + 1) & 3;
+      phase ^= 1;
     }
   }
   portEXIT_CRITICAL_ISR(&controlMux);
@@ -101,7 +98,7 @@ void sendStatus() {
   snprintf(json, sizeof(json),
     "{\"periodUs\":%lu,\"tonUs\":%lu,\"mask\":%lu,\"running\":%s,"
     "\"revision\":%lu,\"bootId\":%lu,\"ready\":%s,\"reason\":\"%s\","
-    "\"pins\":[13,14,26,33,22,19,5,16,2,27,12,25,32,23,18,17,4,15],"
+    "\"pins\":[22,23],"
     "\"uptimeMs\":%lu,\"freeHeap\":%lu,\"minHeap\":%lu,\"resetReason\":%d,\"timerFaults\":%lu,"
     "\"limits\":{\"minPeriodUs\":4000,\"maxPeriodUs\":1000000,\"minTonUs\":100,"
     "\"maxTonUs\":5000,\"maxDutyPercent\":45,\"minGapUs\":100}}",
@@ -150,15 +147,8 @@ void configureOutputs(bool start) {
     stopLocked(CONFIGURED);
     settings = next;
     if (start) {
-      groupLow[0] = groupLow[1] = groupHigh[0] = groupHigh[1] = 0;
-      for (unsigned i = 0; i < 18; ++i) if (next.mask & (1UL << i)) {
-        const unsigned pin = pwmPins[i], group = i / 9;
-        if (pin < 32) groupLow[group] |= 1UL << pin;
-        else groupHigh[group] |= 1UL << (pin - 32);
-      }
-      durations[0] = durations[2] = next.tonUs;
-      durations[1] = next.periodUs / 2 - next.tonUs;
-      durations[3] = next.periodUs - next.periodUs / 2 - next.tonUs;
+      durations[0] = next.tonUs;
+      durations[1] = next.periodUs - next.tonUs;
       phase = 0; running = true; reason = ACTIVE;
       if (!armAfter(100)) timerFault();
     }
@@ -173,7 +163,6 @@ void setup() {
   bootId = esp_random();
   for (int pin : pwmPins) {
     digitalWrite(pin, LOW); pinMode(pin, OUTPUT);
-    if (pin < 32) allLowMask |= 1UL << pin; else allHighMask |= 1UL << (pin - 32);
   }
   allLow();
   gptimer_config_t config = {};
@@ -187,7 +176,7 @@ void setup() {
     gptimer_register_event_callbacks(pulseTimer, &callbacks, nullptr) == ESP_OK &&
     gptimer_enable(pulseTimer) == ESP_OK && gptimer_start(pulseTimer) == ESP_OK;
   if (!timerReady) reason = TIMER_FAULT;
-  Serial.printf("Reset=%d; timer=%d; firmware=timer-v2\n", esp_reset_reason(), timerReady);
+  Serial.printf("Reset=%d; timer=%d; firmware=gpio22-23-sync-v1\n", esp_reset_reason(), timerReady);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
