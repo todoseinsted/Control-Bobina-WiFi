@@ -1,113 +1,86 @@
-# Control Bobina WiFi — versión inicial (18 GPIO)
+# Control Bobina WiFi — GPIO22 y GPIO23 simultáneos
 
-Abrir http://192.168.0.240/ desde la red local. Las credenciales permanecen en
-`secrets.h`, excluido de Git.
+Esta rama conserva el control web, la IP fija, la validación de parámetros y las
+protecciones de comunicación de `main`, pero utiliza **únicamente GPIO22 y GPIO23**.
+Ambos forman una sola salida lógica: se habilitan, suben y bajan juntos.
+No se pueden seleccionar individualmente. Los demás GPIO no se configuran ni se
+manejan como salidas por este programa (su estado de arranque depende del ESP32).
 
-## Uso
+## Funcionamiento de los pulsos
 
-1. Marcar los GPIO que deben generar disparos.
-2. Si hace falta, abrir **Ajustar frecuencia y tiempos**. Los campos están
-   vinculados: `frecuencia = 1000000 / periodoUs`, `duty = 100 * Ton / periodo`,
-   `pausa = periodo / 2 - Ton`.
-3. Pulsar **Iniciar disparos**: aplica los parámetros y la selección e inicia.
-4. Pulsar **Apagar disparos** para detener los 18 GPIO. Conserva la selección
-   del formulario para poder volver a iniciar.
+Por cada período completo se genera un único pulso simultáneo:
 
-Los dos botones principales permanecen visibles al desplazarse por la página.
-Dentro de los ajustes también se puede **Guardar cambios sin iniciar**.
+```text
+GPIO22: ___|‾‾‾|_______|‾‾‾|_______
+GPIO23: ___|‾‾‾|_______|‾‾‾|_______
+             Ton  Toff
+```
 
-Todas las salidas de un grupo comparten el mismo pulso. El grupo B va después
-del A, con una pausa entre ambos. No hay frecuencia individual por GPIO ni
-salida permanentemente en HIGH. Las casillas habilitan o deshabilitan PWM.
+- Frecuencia = 1000000 / período en microsegundos.
+- Ciclo de trabajo = 100 × Ton / período.
+- **Toff = período − Ton**. Ya no existe una pausa entre grupos A y B.
+- Valores iniciales: **100 Hz**, período **10 ms**, **30 %**, Ton **3 ms**, Toff **7 ms**.
+- Se mantienen los límites: 1–250 Hz, Ton de 0,1–5 ms y máximo 45 %.
+- Arranque detenido y pareja deshabilitada; no se guardan ajustes en flash.
 
-Se conserva exactamente el orden y los grupos del archivo original:
+El temporizador GPTimer opera a 1 MHz y genera dos interrupciones por período
+(máximo 500 por segundo). Una escritura de registro activa los bits 22 y 23 a
+la vez; otra escritura los apaga. No hay espera activa ni alternancia entre ellos.
+Los tiempos indicados son consignas: existe latencia de atención de interrupciones.
+Un retraso detectado mayor a 500 us detiene el generador y registra un fallo.
+Esto no garantiza un Ton máximo físico durante cualquier avería.
 
-- A: 13, 14, 26, 33, 22, 19, 5, 16, 2.
-- B: 27, 12, 25, 32, 23, 18, 17, 4, 15.
+## Uso de la página
 
-Parejas físicas: 26/25, 33/32, 22/23, 19/18, 5/17, 16/4, 2/15, 14/27, 13/12.
-Conectores duplicados conectados al mismo GPIO no son independientes.
+1. Abrir http://192.168.0.240/ desde la red local.
+2. Marcar **Habilitar ambos** en la fila GPIO22 + GPIO23.
+3. Ajustar frecuencia, período, porcentaje, Ton o tiempo apagado si hace falta.
+   Los campos se recalculan entre sí.
+4. Pulsar **Iniciar disparos**. Si ya están activos, aplicar los nuevos parámetros
+   detiene el pulso previo e inicia una nueva secuencia simultánea.
+5. Pulsar **Apagar disparos** para llevar ambos GPIO a LOW.
 
-## Límites y comportamiento
+**Guardar cambios sin iniciar** configura y deja detenido. **Restablecer 100 Hz /
+30 %** prepara esos valores en el formulario. **Recuperar valores de la placa**
+lee la configuración actual. Recargar con Ctrl + F5 después de cambiar de firmware.
 
-- Frecuencia: 1–250 Hz; periodo: 4–1000 ms.
-- Ton: 0,1–5 ms, máximo 45 % del periodo y pausa mínima 0,1 ms.
-- Son límites del software: no certifican compatibilidad con la Hellux HE11421.
-- Valores iniciales: 100 Hz, 30 %, Ton 3 ms; todas las salidas deshabilitadas.
-- Reiniciar no recupera una configuración activa. No se guarda en flash.
-- Una configuración válida aplicada detiene primero las salidas.
-- Las configuraciones inválidas se rechazan sin alterar el estado anterior.
-- La desconexión Wi-Fi detectada por el firmware detiene las salidas. Volver a
-  conectarse no las inicia. Cerrar el navegador no equivale a detener.
-- No hay protección por sensores implementada: tampoco estaba activa en el .ino original.
-- Se mantienen IP fija y BSSID del punto de acceso previamente probado.
+El cliente mantiene una sola petición en curso, con tiempo de espera de 3 s.
+Agrupa clics de apagado y cancela respuestas antiguas. Si un inicio pierde su
+respuesta, intenta apagar en lugar de repetir el inicio. La reconexión Wi-Fi no
+reinicia los pulsos; la desconexión detectada los detiene. Cerrar la página no
+los detiene. El botón web depende de la red y no sustituye un paro físico.
 
-Temporizador GPTimer de 1 MHz con cuatro interrupciones por período (máximo
-1000 por segundo). No hay tareas con espera activa. Cada banco de GPIO se
-escribe en conjunto; los GPIO 32/33 requieren una segunda escritura. Se
-programa cada transición desde el momento actual, sin comprimir pulsos para
-recuperar retrasos. Existe un pequeño desfase de servicio de interrupción.
-Un retraso detectado mayor a 500 us detiene las salidas y registra un fallo;
-esto no reemplaza una protección eléctrica ni garantiza un Ton máximo físico.
-La web muestra consignas, no mediciones. Verificar pulsos y polaridad en la
-salida de los PC817 con instrumental antes de conectar la etapa de potencia:
-un GPIO LOW no garantiza por sí solo una entrada de bobina desactivada.
+## API
 
-## API local
+- `GET /status`: parámetros, `pins: [22,23]`, estado, revisión, `bootId`, memoria,
+  tiempo encendido, causa de reinicio y fallos del temporizador.
+- `POST /configure`: configura y deja detenido.
+- `POST /run`: configura e inicia en una sola operación.
+- `POST /stop`: apaga sin requerir parámetros.
 
-- `GET /status`: configuración, estado, revisión, identificador de arranque,
-  orden de GPIO, tiempo encendido, memoria libre, motivo del último reinicio
-  y cantidad de fallos del temporizador.
-- `POST /configure`: `periodUs`, `tonUs`, `mask`, `revision`, `bootId` (enteros
-  decimales). Aplica la configuración y queda detenido.
-- `POST /run`: los mismos parámetros; configura e inicia en una operación.
-  Rechaza revisiones o identificadores de arranque antiguos.
-- `POST /stop`: sin parámetros; siempre permite detener.
+`/configure` y `/run` requieren enteros decimales `periodUs`, `tonUs`, `mask`,
+`revision` y `bootId`. Los dos últimos deben corresponder al estado actual.
+**mask=0** deshabilita ambos y **mask=3** selecciona ambos (bit 0=22, bit 1=23).
+Las máscaras 1, 2 y cualquier otro valor se rechazan. `/run` rechaza mask=0.
+Una orden antigua devuelve HTTP 409; parámetros inválidos devuelven HTTP 400
+sin alterar el estado. No usar máscaras de la versión anterior de 18 GPIO.
 
-El bit 0 de `mask` corresponde a GPIO13 y los demás siguen el orden original,
-no el número del GPIO. Los endpoints antiguos `/setRpm` y `/setFrequency` ya
-no se usan.
+## Validación de esta rama
 
-## Estabilidad de la comunicación
-
-La página mantiene una sola petición en curso, con espera máxima de 3 s.
-Las consultas de estado no se superponen y se pausan con la pestaña oculta.
-Apagar cancela la respuesta pendiente y agrupa clics repetidos en una orden.
-Nunca se reintenta automáticamente un inicio; si se pierde su respuesta,
-se intenta apagar. Un fallo de red se muestra como estado sin confirmar.
-El apagado web depende de que la conexión funcione; no es un paro físico.
-
-Los valores predeterminados y el orden de GPIO siguen siendo los originales.
-La IP es 192.168.0.240. El BSSID se actualizó al punto de acceso de la PC
-verificado el 14/10/2026: E4:C0:E2:91:5F:32 (canal 1). Si la PC cambia a otro
-AP, comprobar la comunicación entre ambos AP antes de atribuirlo al ESP.
-
-Prueba de regresión del cliente (Node.js): `node BancoBobina/tests/ui.cjs`.
-La prueba simula demoras, respuestas perdidas y clics repetidos; no mide los
-pulsos eléctricos. Los resultados de pruebas en la placa se guardan aparte.
-
-## Verificación en la placa — 14/10/2026
-
-- Compilación ESP32 Arduino 3.3.12: 946868 bytes de programa, 47592 bytes de RAM estática.
-- Carga USB en COM3 con verificación de hash correcta.
-- 295 peticiones en 75,19 s: validaciones, órdenes antiguas, 80 cambios,
-  30 lecturas concurrentes, 60 inicios/reconfiguraciones y 30 apagados.
-- 60 s sostenidos a 250 Hz / 45 % con los 18 GPIO habilitados, sin alimentación
-  de 12 V en las bobinas. Sin reinicios ni fallos de temporizador registrados.
-- Latencia HTTP máxima observada: 258 ms; media: 48 ms.
-- Memoria libre al finalizar: 223696 bytes. No se observó agotamiento de memoria.
-- Página servida por la placa idéntica al archivo local; pruebas de cliente aprobadas.
-- Estado final: apagado, selección vacía, valores de 100 Hz / 30 %.
-
-Detalle reproducible: `BancoBobina/tests/hardware-result.json`. Para repetir la prueba con
-pulsos, desconectar primero los 12 V y ejecutar `python BancoBobina/tests/stress.py --pulses`.
-Sin `--pulses`, sólo se prueban configuraciones detenidas. La prueba no certifica
-la duración eléctrica de los pulsos ni el funcionamiento con bobinas energizadas.
+Las pruebas del cliente verifican la selección conjunta, la pausa de 7 ms,
+la serialización de órdenes, apagados repetidos y recuperación tras errores.
+La compilación se comprueba con el core ESP32 3.3.12.
+**Esta variante no fue cargada ni medida físicamente en el ESP32.**
+`BancoBobina/tests/hardware-result-main-18gpio.json` contiene únicamente los
+resultados históricos de `main`, no una prueba de esta variante.
+El script `tests/stress.py` se adaptó a máscaras 0/3. Ejecutarlo con `--pulses`
+activa ambos GPIO y requiere desconectar previamente la alimentación de bobinas.
+Los límites de software no certifican compatibilidad eléctrica con la Hellux.
 
 ## Instalación y archivos
 
-Esta rama `main` conserva la primera versión: dos grupos de nueve GPIO alternados.
-La variante de sólo GPIO22/23 simultáneos está en `codex/gpio22-23-simultaneos`.
+Esta rama es `codex/gpio22-23-simultaneos`. La primera versión de 18 GPIO
+alternados permanece disponible en `main`.
 
 1. Instalar Arduino IDE con el paquete **esp32 de Espressif**, versión probada 3.3.12.
 2. Abrir `BancoBobina/BancoBobina.ino` y seleccionar **ESP32 Dev Module**.
